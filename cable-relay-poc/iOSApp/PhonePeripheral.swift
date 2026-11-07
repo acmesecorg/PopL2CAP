@@ -2,16 +2,6 @@
 //  PhonePeripheral.swift
 //  cable-relay-poc — VICTIM PHONE role (runs on the iPhone)
 //
-//  Plays the authenticator (Noise NKpsk0 responder). It:
-//    1. Advertises a service and publishes an INSECURE L2CAP CoC (per PXP
-//       spec: no link-layer encryption), exposing the PSM via GATT.
-//    2. Accepts one L2CAP channel, runs the NKpsk0 responder handshake
-//       (P-256/AES-GCM/SHA-256), then answers an assertionRequest by
-//       signing the challenge with an Ed25519 key.
-//
-//  It is an HONEST participant throughout. It cannot tell that the central
-//  that connected (the iPad) is a relay rather than the real browser.
-//
 
 import Foundation
 import CoreBluetooth
@@ -22,6 +12,16 @@ final class PhonePeripheral: NSObject, ObservableObject {
     @Published var log: [String] = []
     @Published var publishedPSM: CBL2CAPPSM = 0
     @Published var channelOpen = false
+    @Published var ceremonyState: CeremonyState = .idle
+
+    enum CeremonyState: Equatable {
+        case idle
+        case advertising
+        case channelConnected
+        case handshakeComplete
+        case signed
+        case failed(String)
+    }
 
     private var manager: CBPeripheralManager!
     private var psmChar: CBMutableCharacteristic!
@@ -36,6 +36,19 @@ final class PhonePeripheral: NSObject, ObservableObject {
 
     func start() {
         manager = CBPeripheralManager(delegate: self, queue: .main)
+    }
+
+    func retest() {
+        line("--- RETEST: resetting for new ceremony ---")
+        channel?.inputStream.close()
+        channel?.outputStream.close()
+        channel = nil
+        channelOpen = false
+        inBuffer = Data()
+        outQueue = Data()
+        crypter = nil
+        ceremonyState = .advertising
+        manager.publishL2CAPChannel(withEncryption: false)
     }
 
     private func line(_ s: String) {
@@ -70,9 +83,6 @@ extension PhonePeripheral: CBPeripheralManagerDelegate {
     func peripheralManagerDidUpdateState(_ p: CBPeripheralManager) {
         guard p.state == .poweredOn else { line("BLE state \(p.state.rawValue)"); return }
         setupService()
-        // PXP spec: L2CAP CoC MUST be insecure (no link-layer encryption).
-        // withEncryption:false publishes an unencrypted CoC — the Noise layer
-        // above provides all confidentiality and authentication.
         p.publishL2CAPChannel(withEncryption: false)
     }
 
@@ -81,6 +91,7 @@ extension PhonePeripheral: CBPeripheralManagerDelegate {
                            error: Error?) {
         if let e = error { line("publish error \(e.localizedDescription)"); return }
         publishedPSM = PSM
+        ceremonyState = .advertising
         line("published INSECURE L2CAP PSM \(PSM)")
         var be = UInt16(PSM).bigEndian
         psmChar.value = Data(bytes: &be, count: 2)
@@ -102,7 +113,8 @@ extension PhonePeripheral: CBPeripheralManagerDelegate {
         guard let ch = channel else { return }
         self.channel = ch
         channelOpen = true
-        line("L2CAP channel opened from central (insecure CoC)")
+        ceremonyState = .channelConnected
+        line("L2CAP channel opened (insecure CoC)")
         ch.inputStream.delegate = self
         ch.outputStream.delegate = self
         ch.inputStream.schedule(in: .main, forMode: .common)
@@ -163,10 +175,13 @@ extension PhonePeripheral: StreamDelegate {
                       identity: staticKey,
                       message: [UInt8](body))
             else {
-                line("NKpsk0 handshake FAILED"); return
+                line("NKpsk0 handshake FAILED")
+                ceremonyState = .failed("Handshake failed")
+                return
             }
             crypter = hs.result.crypter
             send(Message(type: .handshakeResp, body: Data(hs.response)))
+            ceremonyState = .handshakeComplete
             line("-> handshakeResp; NKpsk0 session established (P-256/AES-GCM)")
 
         case .assertionRequest:
@@ -175,13 +190,18 @@ extension PhonePeripheral: StreamDelegate {
                   let sealed = msg.body,
                   let challenge = c.decrypt([UInt8](sealed))
             else {
-                line("could not decrypt assertion request"); return
+                line("could not decrypt assertion request")
+                ceremonyState = .failed("Decrypt failed")
+                return
             }
             let signature = sign(challenge: Data(challenge))
             guard let out = c.encrypt([UInt8](signature)) else {
-                line("could not encrypt assertion response"); return
+                line("could not encrypt assertion response")
+                ceremonyState = .failed("Encrypt failed")
+                return
             }
             send(Message(type: .assertionResponse, body: Data(out)))
+            ceremonyState = .signed
             line("-> assertionResponse (SIGNED — victim authed a session it never saw)")
 
         case .proximityProbe:
