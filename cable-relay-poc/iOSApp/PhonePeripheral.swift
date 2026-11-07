@@ -2,21 +2,15 @@
 //  PhonePeripheral.swift
 //  cable-relay-poc — VICTIM PHONE role (runs on the iPhone)
 //
-//  Plays the authenticator. It:
-//    1. Advertises a service and publishes an L2CAP CoC, exposing the
-//       dynamic PSM via a GATT characteristic.
-//    2. Accepts one L2CAP channel, runs the responder side of the
-//       handshake, then answers an assertionRequest by "signing" the
-//       challenge with its static identity.
+//  Plays the authenticator (Noise NKpsk0 responder). It:
+//    1. Advertises a service and publishes an INSECURE L2CAP CoC (per PXP
+//       spec: no link-layer encryption), exposing the PSM via GATT.
+//    2. Accepts one L2CAP channel, runs the NKpsk0 responder handshake
+//       (P-256/AES-GCM/SHA-256), then answers an assertionRequest by
+//       signing the challenge with an Ed25519 key.
 //
 //  It is an HONEST participant throughout. It cannot tell that the central
-//  that connected (the iPad) is a relay collector rather than the real
-//  browser. That blindness is the finding, not a bug in this code.
-//
-//  Core Bluetooth note: there is no raw L2CAP socket on Apple platforms.
-//  publishL2CAPChannel(withEncryption:) is the only door to a CoC, and it
-//  hands you a CBL2CAPChannel with paired In/OutputStreams. We drive those
-//  streams manually below.
+//  that connected (the iPad) is a relay rather than the real browser.
 //
 
 import Foundation
@@ -37,8 +31,8 @@ final class PhonePeripheral: NSObject, ObservableObject {
     private var inBuffer = Data()
     private var outQueue = Data()
 
-    private let identity = Identity()
-    private lazy var noise = NoiseBox(role: .responder, staticKey: identity)
+    private lazy var staticKey = PoCKeys.responderIdentity
+    private var crypter: Crypter?
 
     func start() {
         manager = CBPeripheralManager(delegate: self, queue: .main)
@@ -76,10 +70,10 @@ extension PhonePeripheral: CBPeripheralManagerDelegate {
     func peripheralManagerDidUpdateState(_ p: CBPeripheralManager) {
         guard p.state == .poweredOn else { line("BLE state \(p.state.rawValue)"); return }
         setupService()
-        // Publish the CoC. withEncryption:true asks the stack to run the
-        // LE Secure Connections pairing underneath; we also layer our own
-        // handshake on top. The PSM comes back in the delegate below.
-        p.publishL2CAPChannel(withEncryption: true)
+        // PXP spec: L2CAP CoC MUST be insecure (no link-layer encryption).
+        // withEncryption:false publishes an unencrypted CoC — the Noise layer
+        // above provides all confidentiality and authentication.
+        p.publishL2CAPChannel(withEncryption: false)
     }
 
     func peripheralManager(_ p: CBPeripheralManager,
@@ -87,8 +81,7 @@ extension PhonePeripheral: CBPeripheralManagerDelegate {
                            error: Error?) {
         if let e = error { line("publish error \(e.localizedDescription)"); return }
         publishedPSM = PSM
-        line("published L2CAP PSM \(PSM)")
-        // Stash the PSM so a central can read it over GATT.
+        line("published INSECURE L2CAP PSM \(PSM)")
         var be = UInt16(PSM).bigEndian
         psmChar.value = Data(bytes: &be, count: 2)
         advertise()
@@ -109,7 +102,7 @@ extension PhonePeripheral: CBPeripheralManagerDelegate {
         guard let ch = channel else { return }
         self.channel = ch
         channelOpen = true
-        line("L2CAP channel opened from central")
+        line("L2CAP channel opened from central (insecure CoC)")
         ch.inputStream.delegate = self
         ch.outputStream.delegate = self
         ch.inputStream.schedule(in: .main, forMode: .common)
@@ -119,7 +112,7 @@ extension PhonePeripheral: CBPeripheralManagerDelegate {
     }
 }
 
-// MARK: - Stream handling + protocol
+// MARK: - Stream handling + NKpsk0 protocol
 extension PhonePeripheral: StreamDelegate {
 
     func stream(_ aStream: Stream, handle event: Stream.Event) {
@@ -163,32 +156,35 @@ extension PhonePeripheral: StreamDelegate {
         switch msg.type {
 
         case .handshakeInit:
-            line("<- handshakeInit")
-            let resp = try! noise.makeResp(consuming: msg.body ?? Data())
-            send(Message(type: .handshakeResp, body: resp))
-            line("-> handshakeResp")
-
-        case .handshakeFinal:
-            line("<- handshakeFinal")
-            try? noise.consumeFinal(msg.body ?? Data())
-            line("session key established (responder)")
+            line("<- handshakeInit (NKpsk0)")
+            guard let body = msg.body,
+                  let hs = CableHandshake.respond(
+                      psk: PoCKeys.psk,
+                      identity: staticKey,
+                      message: [UInt8](body))
+            else {
+                line("NKpsk0 handshake FAILED"); return
+            }
+            crypter = hs.result.crypter
+            send(Message(type: .handshakeResp, body: Data(hs.response)))
+            line("-> handshakeResp; NKpsk0 session established (P-256/AES-GCM)")
 
         case .assertionRequest:
             line("<- assertionRequest")
-            // "Sign" the challenge: open the AEAD blob, sign, seal the result.
-            // The challenge here stands in for CTAP2 clientDataHash.
-            guard let sealed = msg.body,
-                  let challenge = try? noise.open(sealed) else {
-                line("could not open assertion request"); return
+            guard let c = crypter,
+                  let sealed = msg.body,
+                  let challenge = c.decrypt([UInt8](sealed))
+            else {
+                line("could not decrypt assertion request"); return
             }
-            let signature = sign(challenge: challenge)
-            let out = try! noise.seal(signature)
-            send(Message(type: .assertionResponse, body: out))
-            line("-> assertionResponse (SIGNED — victim just authed a session it never saw)")
+            let signature = sign(challenge: Data(challenge))
+            guard let out = c.encrypt([UInt8](signature)) else {
+                line("could not encrypt assertion response"); return
+            }
+            send(Message(type: .assertionResponse, body: Data(out)))
+            line("-> assertionResponse (SIGNED — victim authed a session it never saw)")
 
         case .proximityProbe:
-            // Immediately echo. The app-layer RTT this produces is uselessly
-            // coarse (BLE connection interval + relay). See the Mac side read-out.
             send(Message(type: .proximityEcho, probeNonce: msg.probeNonce, tMicros: nowMicros()))
 
         default:
@@ -197,13 +193,11 @@ extension PhonePeripheral: StreamDelegate {
     }
 
     private func sign(challenge: Data) -> Data {
-        // Ed25519 over the challenge with a per-launch signing key.
-        // (Separate from the KA identity; CryptoKit keeps them distinct.)
         let signing = Curve25519.Signing.PrivateKey()
         let sig = try! signing.signature(for: challenge)
         var out = Data()
-        out.append(signing.publicKey.rawRepresentation) // 32
-        out.append(sig)                                  // 64
+        out.append(signing.publicKey.rawRepresentation)
+        out.append(sig)
         return out
     }
 }

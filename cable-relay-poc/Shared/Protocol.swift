@@ -3,23 +3,24 @@
 //  cable-relay-poc — Shared wire protocol
 //
 //  This file is COMPILED INTO BOTH the iOS app and the Mac relay.
-//  It defines the framing and message types for the minimal caBLE-like
-//  hybrid ceremony. Keep it free of platform imports (no CoreBluetooth,
+//  It defines the framing and message types for the caBLE/PXP relay
+//  ceremony. Keep it free of platform imports (no CoreBluetooth,
 //  no Network) so it drops cleanly into every target.
+//
+//  PXP ALIGNMENT (FIDO Proximity Exchange Protocol v1.0)
+//  -----------------------------------------------------
+//  - L2CAP CoC: INSECURE (no link-layer encryption), per PXP spec
+//  - Noise handshake: NKpsk0 (P-256 / AES-256-GCM / SHA-256)
+//  - PSK + responder static key: derived from shared QR secret
+//  - Framing: 4-byte big-endian length prefix (identical on L2CAP and TCP)
 //
 //  THE PROPERTY UNDER TEST
 //  -----------------------
-//  A connection-oriented, encrypted, mutually-authenticated channel
-//  (here: BLE L2CAP CoC carrying a Noise-style handshake) does NOT
-//  establish physical proximity. It is relayable end-to-end with no
-//  cryptographic break. The relay forwards opaque frames; both honest
-//  endpoints complete the ceremony and agree a key, while the two
-//  radios that actually spoke are 1 metre apart and the "browser"
-//  is on another network entirely.
-//
-//  We model the Noise/crypto layer abstractly (see NoiseBox) so the
-//  demo stays ~readable. Where a real caBLE value would sit, a comment
-//  marks the correspondence.
+//  The Noise NKpsk0 channel does NOT establish physical proximity. It
+//  is relayable end-to-end with no cryptographic break. The relay
+//  forwards opaque frames; both honest endpoints complete the ceremony
+//  and agree a key, while the two radios that actually spoke are 1 m
+//  apart and the "browser" is on another network entirely.
 //
 
 import Foundation
@@ -67,9 +68,8 @@ enum Frame {
 // affordance, not a production choice.
 
 enum MessageType: String, Codable {
-    case handshakeInit      // browser  -> phone : Noise msg 1 (+ ephemeral)   | caBLE: Noise e
-    case handshakeResp      // phone    -> browser: Noise msg 2 (+ ephemeral)   | caBLE: Noise e,ee
-    case handshakeFinal     // browser  -> phone : Noise msg 3 (confirm)        | caBLE: Noise s,se
+    case handshakeInit      // browser  -> phone : NKpsk0 msg 1 (ePub + AEAD)  | PXP: Noise e, es
+    case handshakeResp      // phone    -> browser: NKpsk0 msg 2 (ePub + AEAD) | PXP: Noise e, ee
     case assertionRequest   // browser  -> phone : "sign this challenge"        | caBLE: CTAP2 getAssertion
     case assertionResponse  // phone    -> browser: signature over challenge    | caBLE: CTAP2 assertion
     case proximityProbe     // browser  -> phone : app-layer RTT ping (demo)    | the thing that CANNOT bound a relay
@@ -78,8 +78,7 @@ enum MessageType: String, Codable {
 
 struct Message: Codable {
     var type: MessageType
-    /// Opaque, already-"encrypted" blob for handshake/assertion bodies.
-    /// In this PoC NoiseBox is a stand-in; swap for a real Noise lib.
+    /// Opaque body: NKpsk0 handshake messages or Crypter-sealed payloads.
     var body: Data?
     /// Monotonic nonce used only for the RTT probe demonstration.
     var probeNonce: UInt64?

