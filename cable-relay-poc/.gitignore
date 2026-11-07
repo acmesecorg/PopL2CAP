@@ -1,0 +1,4 @@
+build/
+*.xcodeproj/
+project.yml
+Shared/AxiomConfig.swift
